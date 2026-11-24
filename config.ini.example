@@ -10,7 +10,7 @@ speech_end_ms = 700
 max_utterance_seconds = 30
 
 [wakeup]
-say_hello = 在
+say_hello = __chime__
 
 [audio]
 playback_gain = 1.0
