@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - src/**
+      - assets/**
+      - config.ini.example
       - toolchain/**
       - CMakeLists.txt
       - armv7-linux-gnueabihf.cmake
