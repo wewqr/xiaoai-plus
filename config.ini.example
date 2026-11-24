@@ -1,11 +1,13 @@
-[realtime]
-app_id = your_app_id
-access_token = your_access_token
-secret_key = your_secret_key
-model = 1.2.1.0
-bot_name = 豆包
-system_role = 你是豆包同学，是小爱音箱上的语音助手。
-speaking_style = 语气自然、友好、简洁。
+[deepseek]
+api_key = your_deepseek_api_key
+api_base = https://api.deepseek.com
+model = deepseek-flash
+voice_id = stella
+system_role = 你是运行在小米智能音箱上的DeepSeek语音助手。回答自然、准确、简洁，适合直接朗读。
+max_tokens = 256
+vad_rms_threshold = 500
+speech_end_ms = 700
+max_utterance_seconds = 30
 
 [wakeup]
 say_hello = 在
