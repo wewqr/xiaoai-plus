@@ -21,7 +21,10 @@ namespace {
 const auto kLog = xiaoai_plus::GetLogger("app");
 
 constexpr int kWakeupTimeoutSec = 60;
-constexpr int kWelcomeResponseTimeoutSec = 8;
+// DeepSeek uses separate ASR/chat/TTS HTTP calls.  The first TTS request can
+// take a few seconds on a cold connection, so leave enough time for the local
+// welcome response before treating the session as failed.
+constexpr int kWelcomeResponseTimeoutSec = 25;
 constexpr float kKwsThreshold = 0.20f;
 constexpr int kMinTriggerIntervalMs = 800;
 
