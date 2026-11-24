@@ -77,6 +77,25 @@ std::vector<uint8_t> Resample24kTo16k(const std::vector<uint8_t>& pcm24k) {
   return output;
 }
 
+std::vector<uint8_t> MakeWakeChime() {
+  constexpr int kRate = 16000;
+  constexpr int kFrames = 2880;  // 180 ms
+  constexpr double kPi = 3.14159265358979323846;
+  std::vector<uint8_t> pcm;
+  pcm.reserve(kFrames * sizeof(int16_t));
+  for (int i = 0; i < kFrames; ++i) {
+    const double attack = std::min(1.0, i / 160.0);
+    const double decay = std::min(1.0, (kFrames - i) / 640.0);
+    const double t = static_cast<double>(i) / kRate;
+    const double tone = std::sin(2.0 * kPi * 880.0 * t) +
+                        0.35 * std::sin(2.0 * kPi * 1320.0 * t);
+    const int16_t sample = static_cast<int16_t>(tone * 5000.0 * attack * decay);
+    pcm.push_back(static_cast<uint8_t>(sample & 0xff));
+    pcm.push_back(static_cast<uint8_t>((sample >> 8) & 0xff));
+  }
+  return pcm;
+}
+
 ix::HttpRequestArgsPtr MakeRequestArgs(const std::string& api_key,
                                        const std::string& content_type) {
   auto args = std::make_shared<ix::HttpRequestArgs>();
@@ -120,12 +139,17 @@ bool Client::Start() {
   // The one-character wake acknowledgement otherwise pays a fresh TLS + TTS
   // round trip on every wake (several seconds on the speaker).  Generate it
   // once at process startup and reuse the PCM locally.
-  std::vector<uint8_t> welcome_pcm24k;
-  if (RequestTts(cfg_.wakeup.say_hello, &welcome_pcm24k)) {
-    welcome_pcm16k_ = Resample24kTo16k(welcome_pcm24k);
-    kLog->info("welcome audio cached: bytes={}", welcome_pcm16k_.size());
+  if (cfg_.wakeup.say_hello == "__chime__") {
+    welcome_pcm16k_ = MakeWakeChime();
+    kLog->info("local wake chime ready: bytes={}", welcome_pcm16k_.size());
   } else {
-    kLog->warn("welcome audio prefetch failed; will retry on wake");
+    std::vector<uint8_t> welcome_pcm24k;
+    if (RequestTts(cfg_.wakeup.say_hello, &welcome_pcm24k)) {
+      welcome_pcm16k_ = Resample24kTo16k(welcome_pcm24k);
+      kLog->info("welcome audio cached: bytes={}", welcome_pcm16k_.size());
+    } else {
+      kLog->warn("welcome audio prefetch failed; will retry on wake");
+    }
   }
   worker_thread_ = std::thread([this]() { WorkerLoop(); });
   return true;
