@@ -191,6 +191,18 @@ bool Client::FinishSession(std::chrono::milliseconds) {
   return true;
 }
 
+void Client::CancelForStockHandoff() {
+  // Do not reset VAD here: the worker may still be inside an HTTP request.
+  session_active_.store(false);
+  ready_for_speech_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    audio_queue_.clear();
+    welcome_pending_ = false;
+  }
+  kLog->info("DeepSeek session yielded to stock XiaoAI");
+}
+
 bool Client::EnqueueAudio(const std::vector<uint8_t>& chunk) {
   if (!session_active_.load() || !ready_for_speech_.load() || chunk.empty()) return true;
   std::lock_guard<std::mutex> lock(queue_mu_);
@@ -338,6 +350,7 @@ void Client::ResetVad() {
 bool Client::ProcessUtterance(const std::vector<uint8_t>& pcm) {
   std::string user_text;
   if (!RequestAsr(pcm, &user_text)) return false;
+  if (!session_active_.load()) return true;
   if (user_text.empty()) {
     kLog->info("ASR returned empty text");
     return true;
@@ -357,6 +370,7 @@ bool Client::ProcessUtterance(const std::vector<uint8_t>& pcm) {
 
   std::string reply;
   if (!RequestChat(user_text, &reply) || reply.empty()) return false;
+  if (!session_active_.load()) return true;
   kLog->info("chat completed: chars={}", reply.size());
   history_.emplace_back(user_text, reply);
   while (history_.size() > 6) history_.pop_front();

@@ -61,6 +61,9 @@ class App {
   void CancelWelcomeTimer();
   void FinishSessionAndDisarm(const std::string& reason);
   void InterruptPlayback();
+  void MonitorStockDialog();
+  void OnStockDialogStarted();
+  void OnStockDialogEnded(const std::string& reason);
 
   config::Config cfg_;
 
@@ -91,6 +94,8 @@ class App {
 
   std::atomic<bool> running_{false};
   std::atomic<bool> stopping_{false};
+  std::atomic<bool> stock_dialog_active_{false};
+  std::thread stock_dialog_thread_;
   std::mutex run_mu_;
   std::condition_variable run_cv_;
   std::thread welcome_thread_;

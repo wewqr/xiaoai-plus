@@ -6,9 +6,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
+#include <cerrno>
+#include <fcntl.h>
 #include <fstream>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 
 #include "common/log.hpp"
 
@@ -194,6 +198,7 @@ App::App(config::Config cfg) : cfg_(std::move(cfg)) {
   trigger_ = std::make_unique<wakeup::Trigger>(
       std::move(wakeup_keywords),
       [this](const std::string& keyword) {
+        if (stock_dialog_active_.load()) return false;
         return gate_->TryWakeup(keyword);
       });
 
@@ -257,6 +262,8 @@ bool App::Run() {
   }
   kLog->info("app components started");
 
+  stock_dialog_thread_ = std::thread([this]() { MonitorStockDialog(); });
+
   std::thread([]() {
     const int rc =
         std::system("/usr/sbin/tts_play.sh '程序已启动' >/dev/null 2>&1");
@@ -291,6 +298,7 @@ void App::Stop() {
   }
 
   CancelWelcomeTimer();
+  if (stock_dialog_thread_.joinable()) stock_dialog_thread_.join();
   if (gate_) gate_->Close();
   if (kws_listener_) kws_listener_->Close();
   if (client_) client_->Stop();
@@ -429,6 +437,7 @@ void App::ExtractChannelS16(const std::vector<uint8_t>& chunk, int channels, int
 }
 
 void App::OnInputAudio(const std::vector<uint8_t>& chunk) {
+  if (stock_dialog_active_.load()) return;
   ConvertS32ToS16(chunk, &s16_buf_);
   // AEC uses one stable mic channel for better linear echo model fitting.
   if (cfg_.audio.channels >= 2) {
@@ -621,6 +630,10 @@ void App::OnChatEnded() {
 }
 
 void App::OnArm(const std::string& reason) {
+  if (stock_dialog_active_.load()) {
+    if (gate_) gate_->Disarm("stock_xiaoai_active");
+    return;
+  }
   kLog->info("gate armed: {}", reason);
   InterruptPlayback();
 
@@ -749,10 +762,103 @@ void App::InterruptPlayback() {
   if (player_) {
     player_->Interrupt();
   }
+  if (stock_dialog_active_.load()) return;
   const int rc = std::system("mphelper pause");
   if (rc != 0) {
     kLog->warn("mphelper pause failed: rc={}", rc);
   }
+}
+
+void App::OnStockDialogStarted() {
+  if (stopping_.load() || stock_dialog_active_.exchange(true)) return;
+  kLog->info("stock XiaoAI dialog started; yielding custom assistant");
+  CancelWelcomeTimer();
+  if (player_) player_->Interrupt();
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    pending_playback_chunks_ = 0;
+    is_ai_speaking_ = false;
+    ResetFarewellStateLocked();
+  }
+  if (client_) client_->CancelForStockHandoff();
+  if (gate_) {
+    gate_->SetAiSpeaking(false);
+    gate_->Disarm("stock_xiaoai_active");
+  }
+}
+
+void App::OnStockDialogEnded(const std::string& reason) {
+  if (!stock_dialog_active_.exchange(false)) return;
+  kLog->info("stock XiaoAI dialog ended: {}; custom wakeup available", reason);
+}
+
+void App::MonitorStockDialog() {
+  constexpr const char* kLogPath = "/var/log/messages";
+  int fd = -1;
+  bool first_open = true;
+  std::string pending;
+  auto last_activity = std::chrono::steady_clock::now();
+  while (running_.load() && !stopping_.load()) {
+    if (fd < 0) {
+      fd = open(kLogPath, O_RDONLY | O_CLOEXEC);
+      if (fd < 0) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+      if (first_open) lseek(fd, 0, SEEK_END);
+      first_open = false;
+      pending.clear();
+    }
+
+    char chunk[4096];
+    const ssize_t count = read(fd, chunk, sizeof(chunk));
+    if (count > 0) {
+      pending.append(chunk, static_cast<size_t>(count));
+      size_t end = 0;
+      while ((end = pending.find('\n')) != std::string::npos) {
+        const std::string line = pending.substr(0, end);
+        pending.erase(0, end + 1);
+        if (line.find("mico_aivs_lab") == std::string::npos) continue;
+        if (line.find("[ns::speech_rec]:DuplexRecognizeStartedHandle start") != std::string::npos) {
+          last_activity = std::chrono::steady_clock::now();
+          OnStockDialogStarted();
+        } else if (stock_dialog_active_.load() &&
+                   (line.find("DuplexHelper::onExitContinuousDialog transaction_id") != std::string::npos ||
+                    line.find("[ns::dialog]:dialog finish force_exit:1") != std::string::npos)) {
+          OnStockDialogEnded("dialog_exit");
+        } else if (stock_dialog_active_.load() &&
+                   (line.find("speech_recognizer.asr=") != std::string::npos ||
+                    line.find("onDuplexRecognizeStarted now") != std::string::npos ||
+                    line.find("dialog finish force_exit:0") != std::string::npos)) {
+          last_activity = std::chrono::steady_clock::now();
+        }
+      }
+      if (pending.size() > 65536) pending.clear();
+      continue;
+    }
+    if (count < 0 && errno != EINTR) {
+      close(fd);
+      fd = -1;
+      continue;
+    }
+
+    struct stat open_stat{};
+    struct stat path_stat{};
+    const off_t offset = lseek(fd, 0, SEEK_CUR);
+    if (fstat(fd, &open_stat) == 0 && stat(kLogPath, &path_stat) == 0 &&
+        (open_stat.st_dev != path_stat.st_dev || open_stat.st_ino != path_stat.st_ino ||
+         (offset >= 0 && path_stat.st_size < offset))) {
+      close(fd);
+      fd = -1;
+      continue;
+    }
+    if (stock_dialog_active_.load() &&
+        std::chrono::steady_clock::now() - last_activity > std::chrono::seconds(90)) {
+      OnStockDialogEnded("log_watchdog");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (fd >= 0) close(fd);
 }
 
 }  // namespace xiaoai_plus::app

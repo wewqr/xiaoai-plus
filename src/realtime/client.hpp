@@ -34,6 +34,7 @@ class Client {
   void Stop();
   bool StartSession(std::chrono::milliseconds timeout = std::chrono::seconds(10));
   bool FinishSession(std::chrono::milliseconds timeout = std::chrono::seconds(2));
+  void CancelForStockHandoff();
   bool EnqueueAudio(const std::vector<uint8_t>& chunk);
   bool EnqueueAudio(std::vector<uint8_t>&& chunk);
   bool SendSayHello();
