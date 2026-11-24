@@ -137,11 +137,17 @@ void Config::normalize() {
 }
 
 void Config::validate() const {
-  if (realtime.app_id.empty()) throw std::runtime_error("realtime.app_id is required");
-  if (realtime.access_token.empty()) {
-    throw std::runtime_error("realtime.access_token is required");
+  if (deepseek.api_key.empty()) throw std::runtime_error("deepseek.api_key is required");
+  if (deepseek.api_base.empty()) throw std::runtime_error("deepseek.api_base is required");
+  if (deepseek.model.empty()) throw std::runtime_error("deepseek.model is required");
+  if (deepseek.voice_id.empty()) throw std::runtime_error("deepseek.voice_id is required");
+  if (deepseek.max_tokens <= 0) throw std::runtime_error("deepseek.max_tokens must be positive");
+  if (deepseek.speech_end_ms < 300) {
+    throw std::runtime_error("deepseek.speech_end_ms must be at least 300");
   }
-  if (realtime.secret_key.empty()) throw std::runtime_error("realtime.secret_key is required");
+  if (deepseek.max_utterance_seconds <= 0 || deepseek.max_utterance_seconds > 120) {
+    throw std::runtime_error("deepseek.max_utterance_seconds must be in 1..120");
+  }
 }
 
 Config load(const std::string& path) {
@@ -151,14 +157,26 @@ Config load(const std::string& path) {
 
     if (auto it = sections.find("realtime"); it != sections.end()) {
       const auto& kv = it->second;
-      cfg.realtime.app_id = GetRequired(kv, "app_id", "realtime.app_id");
-      cfg.realtime.access_token =
-          GetRequired(kv, "access_token", "realtime.access_token");
-      cfg.realtime.secret_key = GetRequired(kv, "secret_key", "realtime.secret_key");
+      SetIfPresent(kv, "app_id", &cfg.realtime.app_id);
+      SetIfPresent(kv, "access_token", &cfg.realtime.access_token);
+      SetIfPresent(kv, "secret_key", &cfg.realtime.secret_key);
       SetIfPresent(kv, "model", &cfg.realtime.preset.model);
       SetIfPresent(kv, "bot_name", &cfg.realtime.preset.bot_name);
       SetIfPresent(kv, "system_role", &cfg.realtime.preset.system_role);
       SetIfPresent(kv, "speaking_style", &cfg.realtime.preset.speaking_style);
+    }
+
+    if (auto it = sections.find("deepseek"); it != sections.end()) {
+      const auto& kv = it->second;
+      cfg.deepseek.api_key = GetRequired(kv, "api_key", "deepseek.api_key");
+      SetIfPresent(kv, "api_base", &cfg.deepseek.api_base);
+      SetIfPresent(kv, "model", &cfg.deepseek.model);
+      SetIfPresent(kv, "voice_id", &cfg.deepseek.voice_id);
+      SetIfPresent(kv, "system_role", &cfg.deepseek.system_role);
+      SetIfPresent(kv, "max_tokens", &cfg.deepseek.max_tokens);
+      SetIfPresent(kv, "vad_rms_threshold", &cfg.deepseek.vad_rms_threshold);
+      SetIfPresent(kv, "speech_end_ms", &cfg.deepseek.speech_end_ms);
+      SetIfPresent(kv, "max_utterance_seconds", &cfg.deepseek.max_utterance_seconds);
     }
 
     if (auto it = sections.find("wakeup"); it != sections.end()) {

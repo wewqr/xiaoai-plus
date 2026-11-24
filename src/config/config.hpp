@@ -21,6 +21,19 @@ struct Realtime {
   RealtimePreset preset;
 };
 
+struct DeepSeek {
+  std::string api_base{"https://api.deepseek.com"};
+  std::string api_key;
+  std::string model{"deepseek-flash"};
+  std::string voice_id{"stella"};
+  std::string system_role{
+      "你是运行在小米智能音箱上的DeepSeek语音助手。回答自然、准确、简洁，适合直接朗读。"};
+  int max_tokens{256};
+  int vad_rms_threshold{500};
+  int speech_end_ms{700};
+  int max_utterance_seconds{30};
+};
+
 struct AudioPreset {
   std::string input_device{"noop"};
   std::string output_device{"default"};
@@ -52,6 +65,7 @@ struct BudgetPreset {
 
 struct Config {
   Realtime realtime;
+  DeepSeek deepseek;
   AudioPreset audio;
   Wakeup wakeup;
   BudgetPreset budget;
