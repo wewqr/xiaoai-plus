@@ -117,6 +117,16 @@ Client::~Client() { Stop(); }
 bool Client::Start() {
   bool expected = false;
   if (!running_.compare_exchange_strong(expected, true)) return true;
+  // The one-character wake acknowledgement otherwise pays a fresh TLS + TTS
+  // round trip on every wake (several seconds on the speaker).  Generate it
+  // once at process startup and reuse the PCM locally.
+  std::vector<uint8_t> welcome_pcm24k;
+  if (RequestTts(cfg_.wakeup.say_hello, &welcome_pcm24k)) {
+    welcome_pcm16k_ = Resample24kTo16k(welcome_pcm24k);
+    kLog->info("welcome audio cached: bytes={}", welcome_pcm16k_.size());
+  } else {
+    kLog->warn("welcome audio prefetch failed; will retry on wake");
+  }
   worker_thread_ = std::thread([this]() { WorkerLoop(); });
   return true;
 }
@@ -309,6 +319,16 @@ bool Client::ProcessUtterance(const std::vector<uint8_t>& pcm) {
     return true;
   }
   kLog->info("ASR completed: chars={}", user_text.size());
+  // The stock XiaoAI service listens independently.  When an active
+  // DeepSeek conversation hears its wake phrase, yield immediately and do
+  // not send the utterance to DeepSeek.
+  if (user_text.find("小爱同学") != std::string::npos) {
+    kLog->info("XiaoAI handoff detected; closing DeepSeek session");
+    session_active_.store(false);
+    ready_for_speech_.store(false);
+    if (callbacks_.on_session_closed) callbacks_.on_session_closed("xiaoai_handoff");
+    return true;
+  }
   if (callbacks_.on_asr_final) callbacks_.on_asr_final(user_text);
 
   std::string reply;
@@ -402,12 +422,20 @@ bool Client::RequestTts(const std::string& text, std::vector<uint8_t>* pcm24k) {
 bool Client::Speak(const std::string& text) {
   if (!session_active_.load()) return false;
   if (callbacks_.on_set_ai_speaking) callbacks_.on_set_ai_speaking(true);
-  std::vector<uint8_t> pcm24k;
-  if (!RequestTts(text, &pcm24k)) {
-    if (callbacks_.on_set_ai_speaking) callbacks_.on_set_ai_speaking(false);
-    return false;
+  std::vector<uint8_t> pcm16k;
+  if (text == cfg_.wakeup.say_hello && !welcome_pcm16k_.empty()) {
+    pcm16k = welcome_pcm16k_;
+  } else {
+    std::vector<uint8_t> pcm24k;
+    if (!RequestTts(text, &pcm24k)) {
+      if (callbacks_.on_set_ai_speaking) callbacks_.on_set_ai_speaking(false);
+      return false;
+    }
+    pcm16k = Resample24kTo16k(pcm24k);
+    if (text == cfg_.wakeup.say_hello && !pcm16k.empty()) {
+      welcome_pcm16k_ = pcm16k;
+    }
   }
-  auto pcm16k = Resample24kTo16k(pcm24k);
   constexpr size_t kChunkBytes = 640;
   for (size_t offset = 0; offset < pcm16k.size() && session_active_.load();
        offset += kChunkBytes) {

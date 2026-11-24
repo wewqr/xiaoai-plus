@@ -61,6 +61,7 @@ class Client {
   std::deque<std::vector<uint8_t>> audio_queue_;
   bool welcome_pending_{false};
   std::thread worker_thread_;
+  std::vector<uint8_t> welcome_pcm16k_;
 
   std::deque<std::vector<uint8_t>> pre_roll_;
   std::vector<uint8_t> utterance_;
