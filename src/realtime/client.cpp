@@ -1,699 +1,432 @@
 #include "realtime/client.hpp"
 
 #include <algorithm>
-#include <chrono>
-#include <system_error>
-#include <thread>
+#include <cmath>
+#include <cstring>
 
+#include <ixwebsocket/IXHttpClient.h>
 #include <nlohmann/json.hpp>
+
 #include "common/log.hpp"
 
 namespace xiaoai_plus::realtime {
 
 namespace {
 
-const auto kLog = xiaoai_plus::GetLogger("realtime");
+// DeepSeek speech and chat run directly on the speaker through the official API.
+const auto kLog = xiaoai_plus::GetLogger("deepseek");
 
-std::string GenSessionId() {
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  return "sid-" + std::to_string(now);
+void PutLe16(std::string* out, uint16_t value) {
+  out->push_back(static_cast<char>(value & 0xff));
+  out->push_back(static_cast<char>((value >> 8) & 0xff));
 }
 
-bool AsBool(const nlohmann::json& v) {
-  return v.is_boolean() && v.get<bool>();
+void PutLe32(std::string* out, uint32_t value) {
+  out->push_back(static_cast<char>(value & 0xff));
+  out->push_back(static_cast<char>((value >> 8) & 0xff));
+  out->push_back(static_cast<char>((value >> 16) & 0xff));
+  out->push_back(static_cast<char>((value >> 24) & 0xff));
 }
 
-std::string AsString(const nlohmann::json& v) {
-  return v.is_string() ? v.get<std::string>() : std::string();
+std::string MakeWav(const std::vector<uint8_t>& pcm, int sample_rate) {
+  std::string wav;
+  wav.reserve(44 + pcm.size());
+  wav.append("RIFF", 4);
+  PutLe32(&wav, static_cast<uint32_t>(36 + pcm.size()));
+  wav.append("WAVEfmt ", 8);
+  PutLe32(&wav, 16);
+  PutLe16(&wav, 1);
+  PutLe16(&wav, 1);
+  PutLe32(&wav, static_cast<uint32_t>(sample_rate));
+  PutLe32(&wav, static_cast<uint32_t>(sample_rate * 2));
+  PutLe16(&wav, 2);
+  PutLe16(&wav, 16);
+  wav.append("data", 4);
+  PutLe32(&wav, static_cast<uint32_t>(pcm.size()));
+  wav.append(reinterpret_cast<const char*>(pcm.data()), pcm.size());
+  return wav;
+}
+
+double RmsS16(const std::vector<uint8_t>& pcm) {
+  if (pcm.size() < 2) return 0.0;
+  const auto* samples = reinterpret_cast<const int16_t*>(pcm.data());
+  const size_t count = pcm.size() / sizeof(int16_t);
+  long double sum = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    const long double value = samples[i];
+    sum += value * value;
+  }
+  return std::sqrt(static_cast<double>(sum / count));
+}
+
+std::vector<uint8_t> Resample24kTo16k(const std::vector<uint8_t>& pcm24k) {
+  const size_t input_count = pcm24k.size() / sizeof(int16_t);
+  if (input_count < 2) return {};
+  const auto* input = reinterpret_cast<const int16_t*>(pcm24k.data());
+  const size_t output_count = input_count * 2 / 3;
+  std::vector<uint8_t> output(output_count * sizeof(int16_t));
+  auto* samples = reinterpret_cast<int16_t*>(output.data());
+  for (size_t i = 0; i < output_count; ++i) {
+    const double position = static_cast<double>(i) * 1.5;
+    const size_t left = static_cast<size_t>(position);
+    const size_t right = std::min(left + 1, input_count - 1);
+    const double fraction = position - static_cast<double>(left);
+    const double value = input[left] * (1.0 - fraction) + input[right] * fraction;
+    samples[i] = static_cast<int16_t>(std::clamp(value, -32768.0, 32767.0));
+  }
+  return output;
+}
+
+ix::HttpRequestArgsPtr MakeRequestArgs(const std::string& api_key,
+                                       const std::string& content_type) {
+  auto args = std::make_shared<ix::HttpRequestArgs>();
+  args->connectTimeout = 15;
+  args->transferTimeout = 120;
+  args->compress = false;
+  args->extraHeaders["Authorization"] = "Bearer " + api_key;
+  args->extraHeaders["Content-Type"] = content_type;
+  return args;
+}
+
+void ConfigureTls(ix::HttpClient* http) {
+  ix::SocketTLSOptions tls;
+  tls.caFile = "/etc/ssl/certs/ca-certificates.crt";
+  http->setTLSOptions(tls);
+}
+
+bool HttpOk(const ix::HttpResponsePtr& response, const char* stage) {
+  if (!response) {
+    kLog->error("{} request returned no response", stage);
+    return false;
+  }
+  if (response->errorCode != ix::HttpErrorCode::Ok || response->statusCode != 200) {
+    kLog->error("{} request failed: http={}, transport={}", stage, response->statusCode,
+                static_cast<int>(response->errorCode));
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
 
 Client::Client(config::Config cfg, Callbacks callbacks)
-    : cfg_(std::move(cfg)), callbacks_(std::move(callbacks)), rng_(std::random_device{}()) {}
+    : cfg_(std::move(cfg)), callbacks_(std::move(callbacks)) {}
 
 Client::~Client() { Stop(); }
 
 bool Client::Start() {
   bool expected = false;
-  if (!running_.compare_exchange_strong(expected, true)) {
-    return true;
-  }
-
-  sender_thread_ = std::thread([this]() {
-    while (running_.load()) {
-      std::vector<uint8_t> chunk;
-      {
-        std::unique_lock<std::mutex> lock(audio_mu_);
-        audio_cv_.wait(lock, [this]() { return !running_.load() || !audio_queue_.empty(); });
-        if (!running_.load()) {
-          break;
-        }
-        chunk = std::move(audio_queue_.front());
-        audio_queue_.pop_front();
-      }
-
-      std::string sid;
-      {
-        std::lock_guard<std::mutex> lock(conn_mu_);
-        sid = session_id_;
-      }
-      if (sid.empty()) {
-        continue;
-      }
-
-      try {
-        auto frame = protocol::BuildAudioFrame(protocol::EventId::kTaskRequest, sid, chunk);
-        WriteBinary(frame);
-      } catch (...) {
-        kLog->warn("audio frame send failed");
-      }
-    }
-  });
-
+  if (!running_.compare_exchange_strong(expected, true)) return true;
+  worker_thread_ = std::thread([this]() { WorkerLoop(); });
   return true;
 }
 
 void Client::Stop() {
-  if (!running_.exchange(false)) {
-    return;
-  }
-
-  audio_cv_.notify_all();
-  control_cv_.notify_all();
-
-  CloseConnection(true);
-  if (sender_thread_.joinable()) {
-    sender_thread_.join();
-  }
+  if (!running_.exchange(false)) return;
+  session_active_.store(false);
+  ready_for_speech_.store(false);
+  queue_cv_.notify_all();
+  if (worker_thread_.joinable()) worker_thread_.join();
 }
 
-bool Client::StartSession(std::chrono::milliseconds timeout) {
+bool Client::StartSession(std::chrono::milliseconds) {
+  if (!running_.load()) return false;
   {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    if (!session_id_.empty()) {
-      return true;
-    }
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    audio_queue_.clear();
+    welcome_pending_ = false;
   }
-
-  if (!running_.load()) {
-    return false;
-  }
-
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  auto remaining_timeout = [&deadline]() {
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      return std::chrono::milliseconds{0};
-    }
-    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-  };
-
-  nlohmann::json dialog = {
-      {"bot_name", cfg_.realtime.preset.bot_name},
-      {"extra",
-       {{"input_mod", "keep_alive"},
-        {"model", cfg_.realtime.preset.model},
-        {"enable_music", cfg_.realtime.preset.enable_music}}},
-  };
-  if (!cfg_.realtime.preset.system_role.empty()) {
-    dialog["system_role"] = cfg_.realtime.preset.system_role;
-  }
-  if (!cfg_.realtime.preset.speaking_style.empty()) {
-    dialog["speaking_style"] = cfg_.realtime.preset.speaking_style;
-  }
-
-  nlohmann::json payload = {
-      {"dialog", std::move(dialog)},
-      {"tts", {{"speaker", "zh_female_vv_jupiter_bigtts"},
-               {"audio_config", {{"channel", cfg_.audio.channels},
-                                    {"format", "pcm_s16le"},
-                                    {"sample_rate", cfg_.audio.sample_rate}}}}},
-  };
-
-  for (int attempt = 0; attempt < 2 && running_.load(); ++attempt) {
-    const auto connect_timeout = remaining_timeout();
-    if (connect_timeout.count() <= 0) {
-      kLog->error("start session timeout before connection ready");
-      return false;
-    }
-    if (!EnsureConnection(connect_timeout)) {
-      kLog->error("start session failed: ensure connection failed");
-      return false;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(control_mu_);
-      control_queue_.erase(
-          std::remove_if(control_queue_.begin(), control_queue_.end(), [](const protocol::Frame& frame) {
-            if (!frame.event_id.has_value()) {
-              return false;
-            }
-            return *frame.event_id == protocol::EventId::kSessionStarted ||
-                   *frame.event_id == protocol::EventId::kSessionFinished ||
-                   *frame.event_id == protocol::EventId::kSessionFailed ||
-                   *frame.event_id == protocol::EventId::kDialogCommonError;
-          }),
-          control_queue_.end());
-    }
-
-    const std::string sid = GenSessionId();
-    if (!SendJsonEvent(protocol::EventId::kStartSession, payload, sid)) {
-      kLog->error("start session failed: send start_session event failed");
-      CloseConnection(false);
-      continue;
-    }
-
-    protocol::Frame frame;
-    const auto wait_timeout = remaining_timeout();
-    if (wait_timeout.count() <= 0) {
-      kLog->error("start session timeout while waiting session response");
-      return false;
-    }
-    if (!WaitControlEvent({protocol::EventId::kSessionStarted, protocol::EventId::kSessionFailed,
-                           protocol::EventId::kDialogCommonError},
-                          sid, wait_timeout, &frame)) {
-      kLog->error("start session failed: no session control event before timeout");
-      CloseConnection(false);
-      continue;
-    }
-    if (frame.event_id == protocol::EventId::kSessionFailed ||
-        frame.event_id == protocol::EventId::kDialogCommonError) {
-      kLog->error("start session rejected by server");
-      return false;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(conn_mu_);
-      session_id_ = sid;
-    }
-    kLog->info("session started: sid={}", sid);
-    return true;
-  }
-  return false;
+  history_.clear();
+  ResetVad();
+  session_active_.store(true);
+  ready_for_speech_.store(false);
+  kLog->info("DeepSeek session started");
+  return true;
 }
 
-bool Client::FinishSession(std::chrono::milliseconds timeout) {
-  std::string sid;
+bool Client::FinishSession(std::chrono::milliseconds) {
+  session_active_.store(false);
+  ready_for_speech_.store(false);
   {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    sid = session_id_;
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    audio_queue_.clear();
+    welcome_pending_ = false;
   }
-  if (sid.empty()) {
-    return true;
-  }
-
-  bool ok = SendJsonEvent(protocol::EventId::kFinishSession, nlohmann::json::object(), sid);
-  bool got_session_finished = false;
-  if (ok) {
-    protocol::Frame frame;
-    got_session_finished =
-        WaitControlEvent({protocol::EventId::kSessionFinished}, sid, timeout, &frame);
-  }
-
-  // kSessionFinished is handled in HandleFrame and already triggers HandleSessionClosed.
-  // Fallback to local close only when the finish event did not arrive in time.
-  if (!got_session_finished) {
-    HandleSessionClosed("session_finished");
-  }
-  return ok;
+  ResetVad();
+  kLog->info("DeepSeek session finished");
+  return true;
 }
 
 bool Client::EnqueueAudio(const std::vector<uint8_t>& chunk) {
-  if (chunk.empty()) {
-    return true;
+  if (!session_active_.load() || !ready_for_speech_.load() || chunk.empty()) return true;
+  std::lock_guard<std::mutex> lock(queue_mu_);
+  if (audio_queue_.size() >= static_cast<size_t>(cfg_.budget.input_queue_frames)) {
+    audio_queue_.pop_front();
   }
-  std::lock_guard<std::mutex> lock(audio_mu_);
-  if (static_cast<int>(audio_queue_.size()) >= cfg_.budget.input_queue_frames) {
-    return false;
-  }
-  audio_queue_.emplace_back(chunk);
-  audio_cv_.notify_one();
+  audio_queue_.push_back(chunk);
+  queue_cv_.notify_one();
   return true;
 }
 
 bool Client::EnqueueAudio(std::vector<uint8_t>&& chunk) {
-  if (chunk.empty()) {
-    return true;
-  }
-  std::lock_guard<std::mutex> lock(audio_mu_);
-  if (static_cast<int>(audio_queue_.size()) >= cfg_.budget.input_queue_frames) {
-    return false;
+  if (!session_active_.load() || !ready_for_speech_.load() || chunk.empty()) return true;
+  std::lock_guard<std::mutex> lock(queue_mu_);
+  if (audio_queue_.size() >= static_cast<size_t>(cfg_.budget.input_queue_frames)) {
+    audio_queue_.pop_front();
   }
   audio_queue_.push_back(std::move(chunk));
-  audio_cv_.notify_one();
+  queue_cv_.notify_one();
   return true;
 }
 
 bool Client::SendSayHello() {
-  std::string sid;
+  if (!session_active_.load()) return false;
   {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    sid = session_id_;
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    welcome_pending_ = true;
   }
-  if (sid.empty()) {
-    return true;
-  }
-  return SendJsonEvent(protocol::EventId::kSayHello,
-                       nlohmann::json{{"content", cfg_.wakeup.say_hello}}, sid);
-}
-
-bool Client::EnsureConnection(std::chrono::milliseconds timeout) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  int attempt = 0;
-
-  while (running_.load()) {
-    {
-      std::lock_guard<std::mutex> lock(conn_mu_);
-      if (ws_ && ws_connected_) {
-        return true;
-      }
-    }
-
-    CloseConnection(false);
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      return false;
-    }
-
-    if (OpenConnection(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))) {
-      return true;
-    }
-
-    ++attempt;
-    const auto current = std::chrono::steady_clock::now();
-    if (current >= deadline) {
-      return false;
-    }
-
-    auto backoff = NextBackoff(attempt);
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - current);
-    if (backoff > remaining) {
-      backoff = remaining;
-    }
-    if (backoff.count() > 0) {
-      kLog->warn("connection attempt {} failed, retrying in {}ms", attempt, backoff.count());
-      std::this_thread::sleep_for(backoff);
-    }
-  }
-  return false;
-}
-
-bool Client::OpenConnection(std::chrono::milliseconds timeout) {
-  const auto& url = cfg_.realtime.preset.ws_url;
-
-  kLog->info("connecting to {}", url);
-  auto ws = std::make_unique<ix::WebSocket>();
-  ws->setUrl(url);
-
-  ws->setExtraHeaders({{"X-Api-App-ID", cfg_.realtime.app_id},
-                       {"X-Api-Access-Key", cfg_.realtime.access_token},
-                       {"X-Api-Resource-Id", cfg_.realtime.preset.resource_id},
-                       {"X-Api-App-Key", "PlgvMymc7f3tQnJ6"}});
-
-  ix::SocketTLSOptions tls;
-  tls.caFile = "NONE";
-  ws->setTLSOptions(tls);
-
-  ws->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-    if (msg->type == ix::WebSocketMessageType::Open) {
-      std::lock_guard<std::mutex> lock(conn_mu_);
-      ws_connected_ = true;
-      conn_cv_.notify_all();
-      kLog->info("connection ready");
-      return;
-    }
-
-    if (msg->type == ix::WebSocketMessageType::Close ||
-        msg->type == ix::WebSocketMessageType::Error) {
-      if (msg->type == ix::WebSocketMessageType::Error) {
-        kLog->warn("ws error: {} (retries={}, wait={}ms, http={})",
-                     msg->errorInfo.reason, msg->errorInfo.retries,
-                     msg->errorInfo.wait_time, msg->errorInfo.http_status);
-      }
-      std::string sid;
-      {
-        std::lock_guard<std::mutex> lock(conn_mu_);
-        ws_connected_ = false;
-        sid = session_id_;
-        conn_cv_.notify_all();
-      }
-      if (!sid.empty()) {
-        HandleSessionClosed("connection_lost");
-      }
-      control_cv_.notify_all();
-      return;
-    }
-
-    if (msg->type == ix::WebSocketMessageType::Message && msg->binary) {
-      try {
-        std::vector<uint8_t> payload(msg->str.begin(), msg->str.end());
-        auto frame = protocol::DecodeFrame(payload);
-        if (frame.message_type == protocol::MessageType::kErrorInfo) {
-          kLog->warn("ws server error frame");
-          protocol::Frame control = frame;
-          if (!control.event_id.has_value()) {
-            control.event_id = protocol::EventId::kDialogCommonError;
-          }
-          std::lock_guard<std::mutex> lock(control_mu_);
-          control_queue_.push_back(std::move(control));
-          control_cv_.notify_all();
-          return;
-        }
-        HandleFrame(frame);
-
-        if (frame.event_id.has_value()) {
-          switch (*frame.event_id) {
-            case protocol::EventId::kConnectionStarted:
-            case protocol::EventId::kConnectionFailed:
-            case protocol::EventId::kConnectionFinished:
-            case protocol::EventId::kSessionStarted:
-            case protocol::EventId::kSessionFinished:
-            case protocol::EventId::kSessionFailed:
-            case protocol::EventId::kDialogCommonError: {
-              std::lock_guard<std::mutex> lock(control_mu_);
-              control_queue_.push_back(frame);
-              control_cv_.notify_all();
-              break;
-            }
-            default:
-              break;
-          }
-        }
-      } catch (const std::exception& e) {
-        kLog->error("ws frame decode failed: {}", e.what());
-      } catch (...) {
-        kLog->error("ws frame decode failed: unknown exception");
-      }
-    }
-  });
-
-  {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    ws_connected_ = false;
-  }
-
-  ws->start();
-
-  {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    ws_ = std::move(ws);
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(control_mu_);
-    control_queue_.erase(
-        std::remove_if(control_queue_.begin(), control_queue_.end(), [](const protocol::Frame& frame) {
-          return frame.event_id.has_value() && protocol::is_connect_class_event(*frame.event_id);
-        }),
-        control_queue_.end());
-  }
-
-  // Wait for WebSocket to actually open before sending kStartConnection.
-  {
-    std::unique_lock<std::mutex> lock(conn_mu_);
-    const auto ws_open_timeout = std::min(timeout, std::chrono::milliseconds(8000));
-    if (!conn_cv_.wait_for(lock, ws_open_timeout, [this] { return ws_connected_; })) {
-      CloseConnection(false);
-      return false;
-    }
-  }
-
-  if (!SendJsonEvent(protocol::EventId::kStartConnection, nlohmann::json::object(), std::nullopt)) {
-    CloseConnection(false);
-    return false;
-  }
-
-  protocol::Frame frame;
-  const auto wait_timeout = std::min(timeout, std::chrono::milliseconds(8000));
-  if (!WaitControlEvent({protocol::EventId::kConnectionStarted,
-                         protocol::EventId::kConnectionFailed,
-                         protocol::EventId::kDialogCommonError},
-                        std::nullopt, wait_timeout, &frame)) {
-    CloseConnection(false);
-    return false;
-  }
-  if (frame.event_id == protocol::EventId::kConnectionFailed ||
-      frame.event_id == protocol::EventId::kDialogCommonError) {
-    CloseConnection(false);
-    return false;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    ws_connected_ = true;
-  }
+  queue_cv_.notify_one();
   return true;
 }
 
-void Client::CloseConnection(bool send_finish_event) {
-  if (send_finish_event) {
-    (void)SendJsonEvent(protocol::EventId::kFinishConnection, nlohmann::json::object(), std::nullopt);
-  }
-
-  std::unique_ptr<ix::WebSocket> ws;
-  {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    ws_connected_ = false;
-    session_id_.clear();
-    ws = std::move(ws_);
-  }
-  if (ws) {
-    try {
-      ws->stop();
-    } catch (const std::system_error& e) {
-      kLog->error("ws stop failed with system_error: {}", e.what());
-    } catch (const std::exception& e) {
-      kLog->error("ws stop failed: {}", e.what());
-    } catch (...) {
-      kLog->error("ws stop failed: unknown exception");
-    }
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(control_mu_);
-    control_queue_.clear();
-  }
-}
-
-void Client::HandleFrame(const protocol::Frame& frame) {
-  if (!frame.event_id.has_value()) {
-    return;
-  }
-
-  switch (*frame.event_id) {
-    case protocol::EventId::kAsrResponse:
-      HandleAsrResponse(frame.JsonPayload());
-      break;
-    case protocol::EventId::kAsrInfo:
-      HandleAsrInfo();
-      break;
-    case protocol::EventId::kTtsResponse:
-      HandleTtsResponse(frame);
-      break;
-    case protocol::EventId::kTtsEnded:
-      HandleTtsEnded();
-      break;
-    case protocol::EventId::kChatResponse:
-      HandleChatResponse(frame.JsonPayload());
-      break;
-    case protocol::EventId::kChatEnded:
-      HandleChatEnded();
-      break;
-    case protocol::EventId::kSessionFinished:
-      HandleSessionClosed("session_finished");
-      break;
-    case protocol::EventId::kDialogCommonError:
-    case protocol::EventId::kSessionFailed:
-      HandleSessionClosed("session_failed");
-      break;
-    default:
-      break;
-  }
-}
-
-void Client::HandleAsrResponse(const nlohmann::json& payload) {
-  if (!payload.is_object()) {
-    return;
-  }
-  auto it = payload.find("results");
-  if (it == payload.end() || !it->is_array()) {
-    return;
-  }
-
-  for (const auto& item : *it) {
-    if (!item.is_object()) {
-      continue;
-    }
-    if (AsBool(item.value("is_interim", false))) {
-      continue;
-    }
-    if (callbacks_.on_asr_final) {
-      const auto text = AsString(item.value("text", ""));
-      kLog->info("asr final: '{}'", text);
-      callbacks_.on_asr_final(text);
-    }
-  }
-}
-
-void Client::HandleAsrInfo() {
-  // Use ASRInfo (event 450) as the single barge-in signal.
-  if (callbacks_.on_user_activity) {
-    callbacks_.on_user_activity();
-  }
-}
-
-void Client::HandleTtsResponse(const protocol::Frame& frame) {
-  bool set_speaking = false;
-  {
-    std::lock_guard<std::mutex> lock(event_mu_);
-    if (!is_ai_speaking_) {
-      is_ai_speaking_ = true;
-      set_speaking = true;
-    }
-  }
-
-  if (set_speaking && callbacks_.on_set_ai_speaking) {
-    kLog->info("tts started");
-    callbacks_.on_set_ai_speaking(true);
-  }
-  if (callbacks_.on_audio && !frame.payload.empty()) {
-    callbacks_.on_audio(frame.payload);
-  }
-}
-
-void Client::HandleTtsEnded() {
-  bool was_speaking = false;
-  {
-    std::lock_guard<std::mutex> lock(event_mu_);
-    if (is_ai_speaking_) {
-      is_ai_speaking_ = false;
-      was_speaking = true;
-    }
-  }
-  if (was_speaking && callbacks_.on_set_ai_speaking) {
-    kLog->info("tts ended");
-    callbacks_.on_set_ai_speaking(false);
-  }
-}
-
-void Client::HandleChatResponse(const nlohmann::json& payload) {
-  if (!payload.is_object()) {
-    return;
-  }
-}
-
-void Client::HandleChatEnded() {
-  if (callbacks_.on_chat_ended) {
-    callbacks_.on_chat_ended();
-  }
-}
-
-void Client::HandleSessionClosed(const std::string& reason) {
-  {
-    std::lock_guard<std::mutex> lock(conn_mu_);
-    session_id_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> lock(event_mu_);
-    is_ai_speaking_ = false;
-  }
-  if (callbacks_.on_set_ai_speaking) {
-    callbacks_.on_set_ai_speaking(false);
-  }
-  if (callbacks_.on_session_closed) {
-    callbacks_.on_session_closed(reason);
-  }
-}
-
-bool Client::SendJsonEvent(protocol::EventId event_id, const nlohmann::json& payload,
-                           const std::optional<std::string>& session_id) {
-  std::vector<uint8_t> frame;
-  try {
-    frame = protocol::BuildJsonFrame(protocol::MessageType::kFullClientRequest, event_id, payload,
-                                     session_id);
-  } catch (...) {
-    kLog->error("json frame build failed");
-    return false;
-  }
-  return WriteBinary(frame);
-}
-
-bool Client::WriteBinary(const std::vector<uint8_t>& payload) {
-  std::lock_guard<std::mutex> lock(write_mu_);
-  std::lock_guard<std::mutex> conn_lock(conn_mu_);
-  if (!ws_) {
-    return false;
-  }
-  auto res = ws_->sendBinary(std::string(reinterpret_cast<const char*>(payload.data()), payload.size()));
-  return res.success;
-}
-
-bool Client::WaitControlEvent(const std::vector<protocol::EventId>& targets,
-                              const std::optional<std::string>& session_id,
-                              std::chrono::milliseconds timeout, protocol::Frame* out_frame) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  auto is_target = [&targets](protocol::EventId event_id) {
-    return std::find(targets.begin(), targets.end(), event_id) != targets.end();
-  };
-
-  std::unique_lock<std::mutex> lock(control_mu_);
+void Client::WorkerLoop() {
   while (running_.load()) {
-    for (auto it = control_queue_.begin(); it != control_queue_.end(); ++it) {
-      if (!it->event_id.has_value()) {
-        continue;
+    std::vector<uint8_t> chunk;
+    bool welcome = false;
+    {
+      std::unique_lock<std::mutex> lock(queue_mu_);
+      queue_cv_.wait(lock, [this]() {
+        return !running_.load() || welcome_pending_ || !audio_queue_.empty();
+      });
+      if (!running_.load()) break;
+      if (welcome_pending_) {
+        welcome_pending_ = false;
+        welcome = true;
+        audio_queue_.clear();
+      } else {
+        chunk = std::move(audio_queue_.front());
+        audio_queue_.pop_front();
       }
-      if (!is_target(*it->event_id)) {
-        continue;
-      }
-      if (session_id.has_value()) {
-        if (it->session_id.has_value()) {
-          if (*it->session_id != *session_id) {
-            continue;
-          }
-        } else {
-          // Some server-side frames may omit session_id.
-          if (*it->event_id != protocol::EventId::kSessionStarted &&
-              *it->event_id != protocol::EventId::kSessionFinished &&
-              *it->event_id != protocol::EventId::kSessionFailed &&
-              *it->event_id != protocol::EventId::kDialogCommonError) {
-            continue;
-          }
-        }
-      }
-      if (out_frame) {
-        *out_frame = *it;
-      }
-      control_queue_.erase(it);
-      return true;
     }
 
-    if (control_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
-      return false;
+    if (welcome) {
+      if (!Speak(cfg_.wakeup.say_hello)) {
+        CloseWithError("deepseek_tts_error");
+        continue;
+      }
+      ResetVad();
+      ready_for_speech_.store(session_active_.load());
+      continue;
     }
+    if (!chunk.empty()) HandleAudioChunk(chunk);
   }
-  return false;
 }
 
-std::chrono::milliseconds Client::NextBackoff(int attempt) const {
-  int min_ms = cfg_.budget.reconnect_backoff_min_ms;
-  int max_ms = cfg_.budget.reconnect_backoff_max_ms;
-  if (min_ms <= 0) {
-    min_ms = 300;
-  }
-  if (max_ms < min_ms) {
-    max_ms = min_ms * 4;
+void Client::HandleAudioChunk(const std::vector<uint8_t>& chunk) {
+  if (!session_active_.load() || !ready_for_speech_.load() || processing_.load()) return;
+  const int frame_ms = std::max(1, static_cast<int>(
+      chunk.size() * 1000 / (sizeof(int16_t) * cfg_.audio.sample_rate)));
+  const double rms = RmsS16(chunk);
+  const double threshold = std::max<double>(cfg_.deepseek.vad_rms_threshold, noise_rms_ * 3.2);
+  const bool voice = rms >= threshold;
+
+  if (!speech_started_) {
+    pre_roll_.push_back(chunk);
+    pre_roll_ms_ += frame_ms;
+    while (pre_roll_ms_ > 400 && !pre_roll_.empty()) {
+      pre_roll_ms_ -= std::max(1, static_cast<int>(pre_roll_.front().size() * 1000 /
+          (sizeof(int16_t) * cfg_.audio.sample_rate)));
+      pre_roll_.pop_front();
+    }
+    if (!voice) {
+      noise_rms_ = noise_rms_ * 0.97 + rms * 0.03;
+      voice_run_ms_ = 0;
+      return;
+    }
+    voice_run_ms_ += frame_ms;
+    if (voice_run_ms_ < 90) return;
+
+    speech_started_ = true;
+    for (const auto& frame : pre_roll_) {
+      utterance_.insert(utterance_.end(), frame.begin(), frame.end());
+    }
+    pre_roll_.clear();
+    pre_roll_ms_ = 0;
+    speech_ms_ = voice_run_ms_;
+    silence_ms_ = 0;
+    if (callbacks_.on_user_activity) callbacks_.on_user_activity();
+    kLog->info("speech started");
+    return;
   }
 
-  int upper = min_ms << std::max(0, attempt - 1);
-  upper = std::min(upper, max_ms);
-  if (upper <= min_ms) {
-    return std::chrono::milliseconds(min_ms);
+  utterance_.insert(utterance_.end(), chunk.begin(), chunk.end());
+  if (voice) {
+    speech_ms_ += frame_ms;
+    silence_ms_ = 0;
+  } else {
+    silence_ms_ += frame_ms;
   }
 
-  std::lock_guard<std::mutex> lock(rng_mu_);
-  std::uniform_int_distribution<int> dist(min_ms, upper);
-  return std::chrono::milliseconds(dist(rng_));
+  const int utterance_ms = static_cast<int>(
+      utterance_.size() * 1000 / (sizeof(int16_t) * cfg_.audio.sample_rate));
+  const bool reached_end = speech_ms_ >= 250 && silence_ms_ >= cfg_.deepseek.speech_end_ms;
+  const bool reached_limit = utterance_ms >= cfg_.deepseek.max_utterance_seconds * 1000;
+  if (!reached_end && !reached_limit) return;
+
+  std::vector<uint8_t> utterance = std::move(utterance_);
+  ResetVad();
+  ready_for_speech_.store(false);
+  processing_.store(true);
+  const bool ok = ProcessUtterance(utterance);
+  processing_.store(false);
+  if (!ok) {
+    CloseWithError("deepseek_api_error");
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    audio_queue_.clear();
+  }
+  ready_for_speech_.store(session_active_.load());
+}
+
+void Client::ResetVad() {
+  pre_roll_.clear();
+  utterance_.clear();
+  speech_started_ = false;
+  voice_run_ms_ = 0;
+  silence_ms_ = 0;
+  speech_ms_ = 0;
+  pre_roll_ms_ = 0;
+  noise_rms_ = 120.0;
+}
+
+bool Client::ProcessUtterance(const std::vector<uint8_t>& pcm) {
+  std::string user_text;
+  if (!RequestAsr(pcm, &user_text)) return false;
+  if (user_text.empty()) {
+    kLog->info("ASR returned empty text");
+    return true;
+  }
+  kLog->info("ASR completed: chars={}", user_text.size());
+  if (callbacks_.on_asr_final) callbacks_.on_asr_final(user_text);
+
+  std::string reply;
+  if (!RequestChat(user_text, &reply) || reply.empty()) return false;
+  kLog->info("chat completed: chars={}", reply.size());
+  history_.emplace_back(user_text, reply);
+  while (history_.size() > 6) history_.pop_front();
+  const bool spoken = Speak(reply);
+  if (callbacks_.on_chat_ended) callbacks_.on_chat_ended();
+  return spoken;
+}
+
+bool Client::RequestAsr(const std::vector<uint8_t>& pcm, std::string* text) {
+  if (!text) return false;
+  ix::HttpClient http;
+  ConfigureTls(&http);
+  const std::string boundary = "----xiaoai-deepseek-audio";
+  const std::string wav = MakeWav(pcm, cfg_.audio.sample_rate);
+  std::string body;
+  body.reserve(wav.size() + 256);
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n";
+  body += "Content-Type: audio/wav\r\n\r\n";
+  body.append(wav);
+  body += "\r\n--" + boundary + "--\r\n";
+  auto args = MakeRequestArgs(cfg_.deepseek.api_key, "multipart/form-data; boundary=" + boundary);
+  args->extraHeaders["Accept"] = "application/json";
+  auto response = http.post(cfg_.deepseek.api_base + "/v1/tools/asr", body, args);
+  if (!HttpOk(response, "asr")) return false;
+  try {
+    auto json = nlohmann::json::parse(response->body);
+    *text = json.value("text", "");
+    return true;
+  } catch (...) {
+    kLog->error("asr response was not valid JSON");
+    return false;
+  }
+}
+
+bool Client::RequestChat(const std::string& user_text, std::string* reply) {
+  if (!reply) return false;
+  nlohmann::json messages = nlohmann::json::array();
+  messages.push_back({{"role", "system"}, {"content", cfg_.deepseek.system_role}});
+  for (const auto& turn : history_) {
+    messages.push_back({{"role", "user"}, {"content", turn.first}});
+    messages.push_back({{"role", "assistant"}, {"content", turn.second}});
+  }
+  messages.push_back({{"role", "user"}, {"content", user_text}});
+  nlohmann::json payload = {
+      {"model", cfg_.deepseek.model},
+      {"messages", std::move(messages)},
+      {"thinking", {{"type", "disabled"}}},
+      {"max_tokens", cfg_.deepseek.max_tokens},
+      {"stream", false},
+  };
+  ix::HttpClient http;
+  ConfigureTls(&http);
+  auto args = MakeRequestArgs(cfg_.deepseek.api_key, "application/json");
+  args->extraHeaders["Accept"] = "application/json";
+  auto response = http.post(cfg_.deepseek.api_base + "/chat/completions", payload.dump(), args);
+  if (!HttpOk(response, "chat")) return false;
+  try {
+    auto json = nlohmann::json::parse(response->body);
+    if (!json.contains("choices") || json["choices"].empty()) return false;
+    *reply = json["choices"][0]["message"].value("content", "");
+    return !reply->empty();
+  } catch (...) {
+    kLog->error("chat response was not valid JSON");
+    return false;
+  }
+}
+
+bool Client::RequestTts(const std::string& text, std::vector<uint8_t>* pcm24k) {
+  if (!pcm24k) return false;
+  nlohmann::json payload = {
+      {"text", text},
+      {"voice_id", cfg_.deepseek.voice_id},
+      {"format", "pcm"},
+      {"filter_markdown", true},
+  };
+  ix::HttpClient http;
+  ConfigureTls(&http);
+  auto args = MakeRequestArgs(cfg_.deepseek.api_key, "application/json");
+  args->extraHeaders["Accept"] = "application/octet-stream";
+  auto response = http.post(cfg_.deepseek.api_base + "/v1/tools/tts", payload.dump(), args);
+  if (!HttpOk(response, "tts")) return false;
+  pcm24k->assign(response->body.begin(), response->body.end());
+  return !pcm24k->empty();
+}
+
+bool Client::Speak(const std::string& text) {
+  if (!session_active_.load()) return false;
+  if (callbacks_.on_set_ai_speaking) callbacks_.on_set_ai_speaking(true);
+  std::vector<uint8_t> pcm24k;
+  if (!RequestTts(text, &pcm24k)) {
+    if (callbacks_.on_set_ai_speaking) callbacks_.on_set_ai_speaking(false);
+    return false;
+  }
+  auto pcm16k = Resample24kTo16k(pcm24k);
+  constexpr size_t kChunkBytes = 640;
+  for (size_t offset = 0; offset < pcm16k.size() && session_active_.load();
+       offset += kChunkBytes) {
+    const size_t end = std::min(offset + kChunkBytes, pcm16k.size());
+    std::vector<uint8_t> chunk(pcm16k.begin() + offset, pcm16k.begin() + end);
+    if (callbacks_.on_audio) callbacks_.on_audio(chunk);
+    // Player's queue is intentionally small.  Pace the raw PCM at real-time
+    // speed so long answers are not queued all at once and silently dropped.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (callbacks_.on_set_ai_speaking) callbacks_.on_set_ai_speaking(false);
+  return session_active_.load();
+}
+
+void Client::CloseWithError(const std::string& reason) {
+  session_active_.store(false);
+  ready_for_speech_.store(false);
+  kLog->error("closing DeepSeek session: {}", reason);
+  if (callbacks_.on_session_closed) callbacks_.on_session_closed(reason);
 }
 
 }  // namespace xiaoai_plus::realtime

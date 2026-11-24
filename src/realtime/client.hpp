@@ -3,19 +3,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
-#include <optional>
-#include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
-#include <ixwebsocket/IXWebSocket.h>
-
 #include "config/config.hpp"
-#include "realtime/frame_codec.hpp"
 
 namespace xiaoai_plus::realtime {
 
@@ -35,7 +32,6 @@ class Client {
 
   bool Start();
   void Stop();
-
   bool StartSession(std::chrono::milliseconds timeout = std::chrono::seconds(10));
   bool FinishSession(std::chrono::milliseconds timeout = std::chrono::seconds(2));
   bool EnqueueAudio(const std::vector<uint8_t>& chunk);
@@ -43,53 +39,39 @@ class Client {
   bool SendSayHello();
 
  private:
-  bool EnsureConnection(std::chrono::milliseconds timeout);
-  bool OpenConnection(std::chrono::milliseconds timeout);
-  void CloseConnection(bool send_finish_event);
-  void HandleFrame(const protocol::Frame& frame);
-  void HandleAsrResponse(const nlohmann::json& payload);
-  void HandleAsrInfo();
-  void HandleTtsResponse(const protocol::Frame& frame);
-  void HandleTtsEnded();
-  void HandleChatResponse(const nlohmann::json& payload);
-  void HandleChatEnded();
-  void HandleSessionClosed(const std::string& reason);
-
-  bool SendJsonEvent(protocol::EventId event_id, const nlohmann::json& payload,
-                     const std::optional<std::string>& session_id);
-  bool WriteBinary(const std::vector<uint8_t>& payload);
-  bool WaitControlEvent(const std::vector<protocol::EventId>& targets,
-                        const std::optional<std::string>& session_id,
-                        std::chrono::milliseconds timeout, protocol::Frame* out_frame);
-  std::chrono::milliseconds NextBackoff(int attempt) const;
+  void WorkerLoop();
+  void HandleAudioChunk(const std::vector<uint8_t>& chunk);
+  void ResetVad();
+  bool ProcessUtterance(const std::vector<uint8_t>& pcm);
+  bool RequestAsr(const std::vector<uint8_t>& pcm, std::string* text);
+  bool RequestChat(const std::string& user_text, std::string* reply);
+  bool RequestTts(const std::string& text, std::vector<uint8_t>* pcm24k);
+  bool Speak(const std::string& text);
+  void CloseWithError(const std::string& reason);
 
   config::Config cfg_;
   Callbacks callbacks_;
-
-  mutable std::mutex conn_mu_;
-  std::condition_variable conn_cv_;
-  std::unique_ptr<ix::WebSocket> ws_;
-  bool ws_connected_{false};
-  std::string session_id_;
-
-  mutable std::mutex write_mu_;
-
-  mutable std::mutex audio_mu_;
-  std::condition_variable audio_cv_;
-  std::deque<std::vector<uint8_t>> audio_queue_;
-
-  mutable std::mutex control_mu_;
-  std::condition_variable control_cv_;
-  std::deque<protocol::Frame> control_queue_;
-
-  mutable std::mutex event_mu_;
-  bool is_ai_speaking_{false};
-
-  mutable std::mutex rng_mu_;
-  mutable std::mt19937 rng_;
-
   std::atomic<bool> running_{false};
-  std::thread sender_thread_;
+  std::atomic<bool> session_active_{false};
+  std::atomic<bool> ready_for_speech_{false};
+  std::atomic<bool> processing_{false};
+
+  std::mutex queue_mu_;
+  std::condition_variable queue_cv_;
+  std::deque<std::vector<uint8_t>> audio_queue_;
+  bool welcome_pending_{false};
+  std::thread worker_thread_;
+
+  std::deque<std::vector<uint8_t>> pre_roll_;
+  std::vector<uint8_t> utterance_;
+  bool speech_started_{false};
+  int voice_run_ms_{0};
+  int silence_ms_{0};
+  int speech_ms_{0};
+  int pre_roll_ms_{0};
+  double noise_rms_{120.0};
+
+  std::deque<std::pair<std::string, std::string>> history_;
 };
 
 }  // namespace xiaoai_plus::realtime
