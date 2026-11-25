@@ -95,6 +95,7 @@ class App {
   std::atomic<bool> running_{false};
   std::atomic<bool> stopping_{false};
   std::atomic<bool> stock_dialog_active_{false};
+  std::atomic<bool> stock_dialog_preempted_{false};
   std::atomic<bool> kws_reset_pending_{false};
   std::thread stock_dialog_thread_;
   std::mutex run_mu_;

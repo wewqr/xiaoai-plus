@@ -198,7 +198,6 @@ App::App(config::Config cfg) : cfg_(std::move(cfg)) {
   trigger_ = std::make_unique<wakeup::Trigger>(
       std::move(wakeup_keywords),
       [this](const std::string& keyword) {
-        if (stock_dialog_active_.load()) return false;
         return gate_->TryWakeup(keyword);
       });
 
@@ -437,7 +436,6 @@ void App::ExtractChannelS16(const std::vector<uint8_t>& chunk, int channels, int
 }
 
 void App::OnInputAudio(const std::vector<uint8_t>& chunk) {
-  if (stock_dialog_active_.load()) return;
   if (kws_reset_pending_.exchange(false) && kws_listener_) kws_listener_->Reset();
   ConvertS32ToS16(chunk, &s16_buf_);
   // AEC uses one stable mic channel for better linear echo model fitting.
@@ -450,6 +448,8 @@ void App::OnInputAudio(const std::vector<uint8_t>& chunk) {
     DownmixToMono(s16_buf_, cfg_.audio.channels, &capture_mono_buf_);
   }
   DownmixToMono(s16_buf_, cfg_.audio.channels, &kws_mono_buf_);
+  if (kws_listener_) kws_listener_->AcceptPcm(kws_mono_buf_);
+  if (stock_dialog_active_.load()) return;
   if (cfg_.audio.channels >= 4) {
     ExtractChannelS16(s16_buf_, cfg_.audio.channels, 3, &reverse_ref_buf_);
   } else {
@@ -461,9 +461,6 @@ void App::OnInputAudio(const std::vector<uint8_t>& chunk) {
   }
   if (aec_ && !reverse_ref_buf_.empty()) {
     aec_->AnalyzeReverseStream(reverse_ref_buf_.data(), reverse_ref_buf_.size());
-  }
-  if (kws_listener_) {
-    kws_listener_->AcceptPcm(kws_mono_buf_);
   }
   if (!gate_ || gate_->step() != wakeup::Step::kActive) {
     return;
@@ -632,8 +629,9 @@ void App::OnChatEnded() {
 
 void App::OnArm(const std::string& reason) {
   if (stock_dialog_active_.load()) {
-    if (gate_) gate_->Disarm("stock_xiaoai_active");
-    return;
+    stock_dialog_preempted_.store(true);
+    stock_dialog_active_.store(false);
+    kLog->info("explicit custom wakeup interrupted stock XiaoAI dialog");
   }
   kLog->info("gate armed: {}", reason);
   InterruptPlayback();
@@ -771,8 +769,10 @@ void App::InterruptPlayback() {
 }
 
 void App::OnStockDialogStarted() {
-  if (stopping_.load() || stock_dialog_active_.exchange(true)) return;
+  if (stopping_.load() || stock_dialog_preempted_.load() ||
+      stock_dialog_active_.exchange(true)) return;
   kLog->info("stock XiaoAI dialog started; yielding custom assistant");
+  kws_reset_pending_.store(true);
   CancelWelcomeTimer();
   if (player_) player_->Interrupt();
   {
@@ -790,6 +790,10 @@ void App::OnStockDialogStarted() {
 
 void App::OnStockDialogEnded(const std::string& reason) {
   kws_reset_pending_.store(true);
+  if (stock_dialog_preempted_.exchange(false)) {
+    kLog->info("stock XiaoAI dialog exited after custom wakeup: {}", reason);
+    return;
+  }
   if (!stock_dialog_active_.exchange(false)) return;
   kLog->info("stock XiaoAI dialog ended: {}; custom wakeup available", reason);
 }
@@ -824,11 +828,11 @@ void App::MonitorStockDialog() {
         if (line.find("[ns::speech_rec]:DuplexRecognizeStartedHandle start") != std::string::npos) {
           last_activity = std::chrono::steady_clock::now();
           OnStockDialogStarted();
-        } else if (stock_dialog_active_.load() &&
+        } else if ((stock_dialog_active_.load() || stock_dialog_preempted_.load()) &&
                    (line.find("DuplexHelper::onExitContinuousDialog transaction_id") != std::string::npos ||
                     line.find("[ns::dialog]:dialog finish force_exit:1") != std::string::npos)) {
           OnStockDialogEnded("dialog_exit");
-        } else if (stock_dialog_active_.load() &&
+        } else if ((stock_dialog_active_.load() || stock_dialog_preempted_.load()) &&
                    (line.find("speech_recognizer.asr=") != std::string::npos ||
                     line.find("onDuplexRecognizeStarted now") != std::string::npos ||
                     line.find("dialog finish force_exit:0") != std::string::npos)) {
@@ -854,7 +858,7 @@ void App::MonitorStockDialog() {
       fd = -1;
       continue;
     }
-    if (stock_dialog_active_.load() &&
+    if ((stock_dialog_active_.load() || stock_dialog_preempted_.load()) &&
         std::chrono::steady_clock::now() - last_activity > std::chrono::seconds(90)) {
       OnStockDialogEnded("log_watchdog");
     }
