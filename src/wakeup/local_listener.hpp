@@ -25,6 +25,7 @@ class LocalListener {
 
   explicit LocalListener(Config cfg);
   void AcceptPcm(const std::vector<uint8_t>& chunk);
+  void Reset();
   void Close();
 
  private:

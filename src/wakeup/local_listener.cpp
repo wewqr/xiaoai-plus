@@ -52,6 +52,14 @@ void LocalListener::AcceptPcm(const std::vector<uint8_t>& chunk) {
   }
 }
 
+void LocalListener::Reset() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return;
+  cfg_.kws_engine->Reset();
+  last_trigger_ = {};
+  kLog->info("kws stream reset after stock XiaoAI dialog");
+}
+
 void LocalListener::Close() {
   std::lock_guard<std::mutex> lock(mu_);
   closed_ = true;

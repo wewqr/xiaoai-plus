@@ -438,6 +438,7 @@ void App::ExtractChannelS16(const std::vector<uint8_t>& chunk, int channels, int
 
 void App::OnInputAudio(const std::vector<uint8_t>& chunk) {
   if (stock_dialog_active_.load()) return;
+  if (kws_reset_pending_.exchange(false) && kws_listener_) kws_listener_->Reset();
   ConvertS32ToS16(chunk, &s16_buf_);
   // AEC uses one stable mic channel for better linear echo model fitting.
   if (cfg_.audio.channels >= 2) {
@@ -788,6 +789,7 @@ void App::OnStockDialogStarted() {
 }
 
 void App::OnStockDialogEnded(const std::string& reason) {
+  kws_reset_pending_.store(true);
   if (!stock_dialog_active_.exchange(false)) return;
   kLog->info("stock XiaoAI dialog ended: {}; custom wakeup available", reason);
 }
